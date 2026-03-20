@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlparse
 
 
 DEFAULT_NO_REPLY_TOKEN = "<NO_REPLY>"
@@ -40,6 +41,11 @@ class AssistantConfig:
     no_reply_token: str
     system_prompt: str
     scan_interval_seconds: float
+    load_delay_seconds: float
+    operation_delay_seconds: float
+    read_step_delay_seconds: float
+    between_sessions_delay_seconds: float
+    post_send_delay_seconds: float
     context_message_count: int
     max_history_messages: int
     search_pages: int
@@ -121,6 +127,18 @@ class OpenAICompatibleChatClient:
         self.no_reply_token = config.no_reply_token
         self.system_prompt = config.system_prompt
 
+    @staticmethod
+    def normalize_api_url(api_url: str) -> str:
+        parsed = urlparse(api_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/chat/completions"):
+            return api_url
+        if path == "":
+            return api_url.rstrip("/") + "/v1/chat/completions"
+        if path == "/v1":
+            return api_url.rstrip("/") + "/chat/completions"
+        return api_url
+
     def generate_reply(
         self,
         friend: str,
@@ -160,9 +178,11 @@ class OpenAICompatibleChatClient:
             "Origin": self.api_header_origin,
             "Referer": self.api_header_referer,
         }
-        req = request.Request(self.api_url, data=body, headers=headers, method="POST")
+        request_url = self.normalize_api_url(self.api_url)
+        req = request.Request(request_url, data=body, headers=headers, method="POST")
         try:
             with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                content_type = response.headers.get("Content-Type", "")
                 response_body = response.read().decode("utf-8")
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
@@ -170,6 +190,15 @@ class OpenAICompatibleChatClient:
         except error.URLError as exc:
             raise RuntimeError(f"AI 接口网络异常: {exc}") from exc
 
+        if "html" in content_type.lower() or response_body.lstrip().lower().startswith(
+            "<!doctype html"
+        ):
+            raise RuntimeError(
+                "AI 接口返回了 HTML 页面，通常说明 AI_API_URL 配置成了网站首页而不是接口地址。"
+                f"当前请求地址: {request_url}。"
+                "请优先检查 .env 中的 AI_API_URL，推荐填写完整接口地址，例如 "
+                "https://your-domain/v1/chat/completions"
+            )
         try:
             data = json.loads(response_body)
         except json.JSONDecodeError as exc:
@@ -323,6 +352,19 @@ def load_config(env_file: Path) -> AssistantConfig:
         no_reply_token=no_reply_token,
         system_prompt=system_prompt,
         scan_interval_seconds=max(1.0, get_env_float("WECHAT_SCAN_INTERVAL_SECONDS", 10.0)),
+        load_delay_seconds=max(1.0, get_env_float("WECHAT_LOAD_DELAY_SECONDS", 4.5)),
+        operation_delay_seconds=max(
+            0.0, get_env_float("WECHAT_OPERATION_DELAY_SECONDS", 1.0)
+        ),
+        read_step_delay_seconds=max(
+            0.0, get_env_float("WECHAT_READ_STEP_DELAY_SECONDS", 0.2)
+        ),
+        between_sessions_delay_seconds=max(
+            0.0, get_env_float("WECHAT_BETWEEN_SESSIONS_DELAY_SECONDS", 1.2)
+        ),
+        post_send_delay_seconds=max(
+            0.0, get_env_float("WECHAT_POST_SEND_DELAY_SECONDS", 1.0)
+        ),
         context_message_count=context_message_count,
         max_history_messages=max_history_messages,
         search_pages=max(0, get_env_int("WECHAT_SEARCH_PAGES", 5)),
@@ -380,6 +422,11 @@ def normalize_reply_text(reply: str, no_reply_token: str) -> str:
     return clean
 
 
+def pause(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
 def load_mock_sessions(mock_file: Path) -> list[MockSession]:
     if not mock_file.exists():
         raise ConfigError(f"未找到 mock 文件: {mock_file}")
@@ -423,6 +470,7 @@ def configure_pyweixin(config: AssistantConfig, global_config: Any) -> None:
     global_config.is_maximize = config.is_maximize
     global_config.close_weixin = False
     global_config.search_pages = config.search_pages
+    global_config.load_delay = float(config.load_delay_seconds)
     global_config.send_delay = float(config.send_delay_seconds)
     global_config.clear = True
 
@@ -500,6 +548,7 @@ def process_session(
         log(f"[dry-run] 将回复 {friend}: {reply}")
     else:
         send_reply(friend, reply)
+        pause(config.post_send_delay_seconds)
         log(f"已回复 {friend}: {reply}")
 
     state_store.mark_processed(
@@ -508,6 +557,67 @@ def process_session(
         unread_messages=unread_messages,
         reply=reply,
     )
+
+
+def pull_messages_from_current_window(
+    current_window: Any,
+    number: int,
+    tools: Any,
+    lists: Any,
+    read_step_delay_seconds: float,
+) -> list[str]:
+    messages: list[str] = []
+    chat_list = current_window.child_window(**lists.FriendChatList)
+    if not chat_list.exists(timeout=0.5):
+        return messages
+
+    items = chat_list.children(control_type="ListItem")
+    if not items:
+        return messages
+
+    messages.append(items[-1].window_text())
+    tools.activate_chatList(chat_list)
+    pause(read_step_delay_seconds)
+    while len(messages) < number:
+        chat_list.type_keys("{UP}")
+        pause(read_step_delay_seconds)
+        selected = [
+            listitem
+            for listitem in chat_list.children(control_type="ListItem")
+            if listitem.has_keyboard_focus()
+        ]
+        if not selected:
+            break
+        selected_item = selected[0]
+        if selected_item.class_name() != "mmui::ChatItemView":
+            messages.append(selected_item.window_text())
+    chat_list.type_keys("{END}")
+    pause(read_step_delay_seconds)
+    return messages[-number:]
+
+
+def send_reply_in_current_window(
+    current_window: Any,
+    reply: str,
+    modules: dict[str, Any],
+    config: AssistantConfig,
+) -> None:
+    edit_area = current_window.child_window(**modules["Edits"].CurrentChatEdit)
+    if not edit_area.exists(timeout=0.5):
+        raise RuntimeError("当前聊天输入框不可用，无法发送回复")
+
+    edit_area.click_input()
+    pause(config.operation_delay_seconds)
+    edit_area.set_text("")
+    pause(config.read_step_delay_seconds)
+    if 0 < len(reply) < 2000:
+        modules["SystemSettings"].copy_text_to_clipboard(reply)
+    else:
+        modules["SystemSettings"].convert_long_text_to_txt(reply)
+    pause(config.read_step_delay_seconds)
+    modules["pyautogui"].hotkey("ctrl", "v", _pause=False)
+    time.sleep(config.send_delay_seconds)
+    modules["pyautogui"].hotkey("alt", "s", _pause=False)
 
 
 def run_once(
@@ -523,6 +633,7 @@ def run_once(
     scan_for_new_messages = modules["scan_for_new_messages"]
 
     main_window = navigator.open_weixin(is_maximize=config.is_maximize)
+    pause(config.operation_delay_seconds)
     unread_sessions = scan_for_new_messages(
         main_window=main_window,
         is_maximize=config.is_maximize,
@@ -540,19 +651,21 @@ def run_once(
                 is_maximize=config.is_maximize,
                 search_pages=config.search_pages,
             )
+            pause(config.operation_delay_seconds)
             if tools.is_group_chat(current_window):
+                pause(config.between_sessions_delay_seconds)
                 continue
 
             history_count = min(
                 config.max_history_messages,
                 max(unread_count, unread_count + config.context_message_count),
             )
-            latest_first_messages = messages.pull_messages(
-                friend=friend,
+            latest_first_messages = pull_messages_from_current_window(
+                current_window=current_window,
                 number=history_count,
-                search_pages=config.search_pages,
-                is_maximize=config.is_maximize,
-                close_weixin=False,
+                tools=tools,
+                lists=modules["Lists"],
+                read_step_delay_seconds=config.read_step_delay_seconds,
             )
             unread_messages, context_messages = split_messages_by_unread_count(
                 latest_first_messages=latest_first_messages,
@@ -567,18 +680,17 @@ def run_once(
                 unread_messages=unread_messages,
                 context_messages=context_messages,
                 dry_run=dry_run,
-                send_reply=lambda target_friend, reply: messages.send_messages_to_friend(
-                    friend=target_friend,
-                    messages=[reply],
-                    search_pages=config.search_pages,
-                    clear=True,
-                    send_delay=config.send_delay_seconds,
-                    is_maximize=config.is_maximize,
-                    close_weixin=False,
+                send_reply=lambda target_friend, reply: send_reply_in_current_window(
+                    current_window=current_window,
+                    reply=reply,
+                    modules=modules,
+                    config=config,
                 ),
             )
+            pause(config.between_sessions_delay_seconds)
         except Exception as exc:
             log(f"处理会话失败 {friend}: {exc}")
+            pause(config.between_sessions_delay_seconds)
 
 
 def run_mock_once(
@@ -611,17 +723,24 @@ def import_wechat_modules() -> dict[str, Any]:
         raise RuntimeError("该脚本只能在 Windows 环境运行。")
     from pyweixin import GlobalConfig, Messages, Navigator
     from pyweixin.Errors import NotFoundError, NotLoginError, NotStartError
+    from pyweixin.Uielements import Edits, Lists
     from pyweixin.WeChatTools import Tools
+    from pyweixin.WinSettings import SystemSettings
     from pyweixin.utils import scan_for_new_messages
+    import pyautogui
 
     return {
+        "Edits": Edits(),
         "GlobalConfig": GlobalConfig,
+        "Lists": Lists(),
         "Messages": Messages,
         "Navigator": Navigator,
         "NotFoundError": NotFoundError,
         "NotLoginError": NotLoginError,
         "NotStartError": NotStartError,
+        "SystemSettings": SystemSettings,
         "Tools": Tools,
+        "pyautogui": pyautogui,
         "scan_for_new_messages": scan_for_new_messages,
     }
 
