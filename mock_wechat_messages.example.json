@@ -1,0 +1,25 @@
+{
+  "sessions": [
+    {
+      "friend": "张三",
+      "unread_messages": [
+        "你明天下午有空吗？",
+        "想跟你确认一下时间"
+      ],
+      "context_messages": [
+        "周五我们可以碰一下",
+        "可以，下午联系",
+        "那我明天再问你"
+      ]
+    },
+    {
+      "friend": "李四",
+      "unread_messages": [
+        "收到后回复我一下"
+      ],
+      "context_messages": [
+        "文件我已经发你了"
+      ]
+    }
+  ]
+}
