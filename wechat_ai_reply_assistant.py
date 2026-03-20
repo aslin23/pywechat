@@ -627,24 +627,28 @@ def send_reply_in_current_window(
     modules["pyautogui"].hotkey("alt", "s", _pause=False)
 
 
-def detect_active_chat_candidate(
-    main_window: Any,
+def detect_window_incoming_candidate(
+    current_window: Any,
     modules: dict[str, Any],
     config: AssistantConfig,
+    friend_hint: str | None = None,
 ) -> ActiveChatCandidate | None:
     tools = modules["Tools"]
-    if tools.is_group_chat(main_window):
+    if tools.is_group_chat(current_window):
         return None
 
-    current_chat_text = main_window.child_window(**modules["Texts"].CurrentChatText)
-    edit_area = main_window.child_window(**modules["Edits"].CurrentChatEdit)
-    chat_list = main_window.child_window(**modules["Lists"].FriendChatList)
+    current_chat_text = current_window.child_window(**modules["Texts"].CurrentChatText)
+    edit_area = current_window.child_window(**modules["Edits"].CurrentChatEdit)
+    if not edit_area.exists(timeout=0.2):
+        edit_area = current_window.child_window(**modules["Edits"].InputEdit)
+    chat_list = current_window.child_window(**modules["Lists"].FriendChatList)
     if not current_chat_text.exists(timeout=0.2):
-        return None
+        if not friend_hint:
+            return None
     if not edit_area.exists(timeout=0.2) or not chat_list.exists(timeout=0.2):
         return None
 
-    friend = current_chat_text.window_text().strip()
+    friend = friend_hint or current_chat_text.window_text().strip()
     if not friend:
         return None
 
@@ -660,7 +664,7 @@ def detect_active_chat_candidate(
             continue
         if item.class_name() == "mmui::ChatItemView":
             continue
-        is_my_bubble = tools.is_my_bubble(main_window, item, edit_area)
+        is_my_bubble = tools.is_my_bubble(current_window, item, edit_area)
         pause(config.read_step_delay_seconds)
         if is_my_bubble:
             break
@@ -676,7 +680,7 @@ def detect_active_chat_candidate(
         len(trailing_incoming_messages_latest_first) + config.context_message_count,
     )
     latest_first_messages = pull_messages_from_current_window(
-        current_window=main_window,
+        current_window=current_window,
         number=history_count,
         tools=tools,
         lists=modules["Lists"],
@@ -696,6 +700,57 @@ def detect_active_chat_candidate(
     )
 
 
+def detect_active_chat_candidate(
+    main_window: Any,
+    modules: dict[str, Any],
+    config: AssistantConfig,
+) -> ActiveChatCandidate | None:
+    return detect_window_incoming_candidate(
+        current_window=main_window,
+        modules=modules,
+        config=config,
+    )
+
+
+def get_visible_session_snapshot(main_window: Any, modules: dict[str, Any]) -> dict[str, str]:
+    chats_button = main_window.child_window(**modules["SideBar"].Chats)
+    session_list = main_window.child_window(**modules["MainWindow"].SessionList)
+    if not session_list.exists(timeout=0.2):
+        chats_button.click_input()
+        pause(0.2)
+    if not session_list.is_visible():
+        chats_button.click_input()
+        pause(0.2)
+    session_list.type_keys("{HOME}")
+    pause(0.2)
+    snapshot: dict[str, str] = {}
+    for item in session_list.children(control_type="ListItem"):
+        friend = item.automation_id().replace("session_item_", "").strip()
+        if not friend:
+            continue
+        snapshot[friend] = " ".join(item.window_text().split())
+    return snapshot
+
+
+def find_session_change_candidates(
+    previous_snapshot: dict[str, str],
+    current_snapshot: dict[str, str],
+    processed_friends: set[str],
+    config: AssistantConfig,
+) -> list[str]:
+    candidates: list[str] = []
+    for friend, current_signature in current_snapshot.items():
+        if friend in processed_friends or friend in config.exclude_friends:
+            continue
+        previous_signature = previous_snapshot.get(friend)
+        if previous_signature is None:
+            candidates.append(friend)
+            continue
+        if current_signature != previous_signature:
+            candidates.append(friend)
+    return candidates
+
+
 def run_once(
     config: AssistantConfig,
     ai_client: OpenAICompatibleChatClient,
@@ -710,6 +765,7 @@ def run_once(
 
     main_window = navigator.open_weixin(is_maximize=config.is_maximize)
     pause(config.operation_delay_seconds)
+    session_snapshot = get_visible_session_snapshot(main_window, modules)
     active_chat_candidate = detect_active_chat_candidate(
         main_window=main_window,
         modules=modules,
@@ -751,6 +807,23 @@ def run_once(
         except Exception as exc:
             log(f"处理当前聊天窗口失败 {active_chat_candidate.friend}: {exc}")
             pause(config.between_sessions_delay_seconds)
+        session_snapshot = get_visible_session_snapshot(main_window, modules)
+
+    pending_change_candidates: list[str] = []
+
+    def enqueue_changed_candidates() -> None:
+        nonlocal session_snapshot, pending_change_candidates
+        current_snapshot = get_visible_session_snapshot(main_window, modules)
+        changed_candidates = find_session_change_candidates(
+            previous_snapshot=session_snapshot,
+            current_snapshot=current_snapshot,
+            processed_friends=processed_friends,
+            config=config,
+        )
+        for candidate in changed_candidates:
+            if candidate not in pending_change_candidates and candidate not in unread_sessions:
+                pending_change_candidates.append(candidate)
+        session_snapshot = current_snapshot
 
     for friend, unread_count in unread_sessions.items():
         if friend in processed_friends:
@@ -805,10 +878,58 @@ def run_once(
                     config=config,
                 ),
             )
+            processed_friends.add(friend)
             pause(config.between_sessions_delay_seconds)
+            enqueue_changed_candidates()
         except Exception as exc:
             log(f"处理会话失败 {friend}: {exc}")
             pause(config.between_sessions_delay_seconds)
+            enqueue_changed_candidates()
+
+    while pending_change_candidates:
+        friend = pending_change_candidates.pop(0)
+        if friend in processed_friends:
+            continue
+        try:
+            current_window = navigator.open_dialog_window(
+                friend=friend,
+                is_maximize=config.is_maximize,
+                search_pages=config.search_pages,
+            )
+            pause(config.operation_delay_seconds)
+            incoming_candidate = detect_window_incoming_candidate(
+                current_window=current_window,
+                modules=modules,
+                config=config,
+                friend_hint=friend,
+            )
+            if incoming_candidate is None:
+                processed_friends.add(friend)
+                pause(config.between_sessions_delay_seconds)
+                enqueue_changed_candidates()
+                continue
+            process_session(
+                config=config,
+                ai_client=ai_client,
+                state_store=state_store,
+                friend=incoming_candidate.friend,
+                unread_messages=incoming_candidate.unread_messages,
+                context_messages=incoming_candidate.context_messages,
+                dry_run=dry_run,
+                send_reply=lambda target_friend, reply: send_reply_in_current_window(
+                    current_window=current_window,
+                    reply=reply,
+                    modules=modules,
+                    config=config,
+                ),
+            )
+            processed_friends.add(friend)
+            pause(config.between_sessions_delay_seconds)
+            enqueue_changed_candidates()
+        except Exception as exc:
+            log(f"处理会话补偿失败 {friend}: {exc}")
+            pause(config.between_sessions_delay_seconds)
+            enqueue_changed_candidates()
 
 
 def run_mock_once(
@@ -841,7 +962,7 @@ def import_wechat_modules() -> dict[str, Any]:
         raise RuntimeError("该脚本只能在 Windows 环境运行。")
     from pyweixin import GlobalConfig, Messages, Navigator
     from pyweixin.Errors import NotFoundError, NotLoginError, NotStartError
-    from pyweixin.Uielements import Edits, Lists, Texts
+    from pyweixin.Uielements import Edits, Lists, Main_window, SideBar, Texts
     from pyweixin.WeChatTools import Tools
     from pyweixin.WinSettings import SystemSettings
     from pyweixin.utils import scan_for_new_messages
@@ -851,11 +972,13 @@ def import_wechat_modules() -> dict[str, Any]:
         "Edits": Edits(),
         "GlobalConfig": GlobalConfig,
         "Lists": Lists(),
+        "MainWindow": Main_window(),
         "Messages": Messages,
         "Navigator": Navigator,
         "NotFoundError": NotFoundError,
         "NotLoginError": NotLoginError,
         "NotStartError": NotStartError,
+        "SideBar": SideBar(),
         "SystemSettings": SystemSettings,
         "Texts": Texts(),
         "Tools": Tools,
