@@ -233,6 +233,13 @@ class MockSession:
     context_messages: list[str]
 
 
+@dataclass
+class ActiveChatCandidate:
+    friend: str
+    unread_messages: list[str]
+    context_messages: list[str]
+
+
 def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
@@ -620,6 +627,75 @@ def send_reply_in_current_window(
     modules["pyautogui"].hotkey("alt", "s", _pause=False)
 
 
+def detect_active_chat_candidate(
+    main_window: Any,
+    modules: dict[str, Any],
+    config: AssistantConfig,
+) -> ActiveChatCandidate | None:
+    tools = modules["Tools"]
+    if tools.is_group_chat(main_window):
+        return None
+
+    current_chat_text = main_window.child_window(**modules["Texts"].CurrentChatText)
+    edit_area = main_window.child_window(**modules["Edits"].CurrentChatEdit)
+    chat_list = main_window.child_window(**modules["Lists"].FriendChatList)
+    if not current_chat_text.exists(timeout=0.2):
+        return None
+    if not edit_area.exists(timeout=0.2) or not chat_list.exists(timeout=0.2):
+        return None
+
+    friend = current_chat_text.window_text().strip()
+    if not friend:
+        return None
+
+    items = chat_list.children(control_type="ListItem")
+    if not items:
+        return None
+
+    trailing_incoming_messages_latest_first: list[str] = []
+    max_incoming_messages = max(1, min(5, config.max_history_messages))
+    for item in reversed(items):
+        text = " ".join(item.window_text().split())
+        if not text:
+            continue
+        if item.class_name() == "mmui::ChatItemView":
+            continue
+        is_my_bubble = tools.is_my_bubble(main_window, item, edit_area)
+        pause(config.read_step_delay_seconds)
+        if is_my_bubble:
+            break
+        trailing_incoming_messages_latest_first.append(text)
+        if len(trailing_incoming_messages_latest_first) >= max_incoming_messages:
+            break
+
+    if not trailing_incoming_messages_latest_first:
+        return None
+
+    history_count = min(
+        config.max_history_messages,
+        len(trailing_incoming_messages_latest_first) + config.context_message_count,
+    )
+    latest_first_messages = pull_messages_from_current_window(
+        current_window=main_window,
+        number=history_count,
+        tools=tools,
+        lists=modules["Lists"],
+        read_step_delay_seconds=config.read_step_delay_seconds,
+    )
+    unread_messages, context_messages = split_messages_by_unread_count(
+        latest_first_messages=latest_first_messages,
+        unread_count=len(trailing_incoming_messages_latest_first),
+        context_message_count=config.context_message_count,
+    )
+    if not unread_messages:
+        return None
+    return ActiveChatCandidate(
+        friend=friend,
+        unread_messages=unread_messages,
+        context_messages=context_messages,
+    )
+
+
 def run_once(
     config: AssistantConfig,
     ai_client: OpenAICompatibleChatClient,
@@ -634,44 +710,86 @@ def run_once(
 
     main_window = navigator.open_weixin(is_maximize=config.is_maximize)
     pause(config.operation_delay_seconds)
+    active_chat_candidate = detect_active_chat_candidate(
+        main_window=main_window,
+        modules=modules,
+        config=config,
+    )
     unread_sessions = scan_for_new_messages(
         main_window=main_window,
         is_maximize=config.is_maximize,
         close_weixin=False,
     )
-    if not unread_sessions:
+    if not unread_sessions and active_chat_candidate is None:
         if config.verbose:
             log("未发现未读消息。")
         return
 
-    for friend, unread_count in unread_sessions.items():
+    processed_friends: set[str] = set()
+    if (
+        active_chat_candidate is not None
+        and active_chat_candidate.friend not in unread_sessions
+    ):
         try:
-            current_window = navigator.open_dialog_window(
-                friend=friend,
-                is_maximize=config.is_maximize,
-                search_pages=config.search_pages,
+            process_session(
+                config=config,
+                ai_client=ai_client,
+                state_store=state_store,
+                friend=active_chat_candidate.friend,
+                unread_messages=active_chat_candidate.unread_messages,
+                context_messages=active_chat_candidate.context_messages,
+                dry_run=dry_run,
+                send_reply=lambda target_friend, reply: send_reply_in_current_window(
+                    current_window=main_window,
+                    reply=reply,
+                    modules=modules,
+                    config=config,
+                ),
             )
-            pause(config.operation_delay_seconds)
-            if tools.is_group_chat(current_window):
-                pause(config.between_sessions_delay_seconds)
-                continue
+            processed_friends.add(active_chat_candidate.friend)
+            pause(config.between_sessions_delay_seconds)
+        except Exception as exc:
+            log(f"处理当前聊天窗口失败 {active_chat_candidate.friend}: {exc}")
+            pause(config.between_sessions_delay_seconds)
 
-            history_count = min(
-                config.max_history_messages,
-                max(unread_count, unread_count + config.context_message_count),
-            )
-            latest_first_messages = pull_messages_from_current_window(
-                current_window=current_window,
-                number=history_count,
-                tools=tools,
-                lists=modules["Lists"],
-                read_step_delay_seconds=config.read_step_delay_seconds,
-            )
-            unread_messages, context_messages = split_messages_by_unread_count(
-                latest_first_messages=latest_first_messages,
-                unread_count=unread_count,
-                context_message_count=config.context_message_count,
-            )
+    for friend, unread_count in unread_sessions.items():
+        if friend in processed_friends:
+            continue
+        try:
+            if (
+                active_chat_candidate is not None
+                and friend == active_chat_candidate.friend
+            ):
+                current_window = main_window
+                unread_messages = active_chat_candidate.unread_messages
+                context_messages = active_chat_candidate.context_messages
+            else:
+                current_window = navigator.open_dialog_window(
+                    friend=friend,
+                    is_maximize=config.is_maximize,
+                    search_pages=config.search_pages,
+                )
+                pause(config.operation_delay_seconds)
+                if tools.is_group_chat(current_window):
+                    pause(config.between_sessions_delay_seconds)
+                    continue
+
+                history_count = min(
+                    config.max_history_messages,
+                    max(unread_count, unread_count + config.context_message_count),
+                )
+                latest_first_messages = pull_messages_from_current_window(
+                    current_window=current_window,
+                    number=history_count,
+                    tools=tools,
+                    lists=modules["Lists"],
+                    read_step_delay_seconds=config.read_step_delay_seconds,
+                )
+                unread_messages, context_messages = split_messages_by_unread_count(
+                    latest_first_messages=latest_first_messages,
+                    unread_count=unread_count,
+                    context_message_count=config.context_message_count,
+                )
             process_session(
                 config=config,
                 ai_client=ai_client,
@@ -723,7 +841,7 @@ def import_wechat_modules() -> dict[str, Any]:
         raise RuntimeError("该脚本只能在 Windows 环境运行。")
     from pyweixin import GlobalConfig, Messages, Navigator
     from pyweixin.Errors import NotFoundError, NotLoginError, NotStartError
-    from pyweixin.Uielements import Edits, Lists
+    from pyweixin.Uielements import Edits, Lists, Texts
     from pyweixin.WeChatTools import Tools
     from pyweixin.WinSettings import SystemSettings
     from pyweixin.utils import scan_for_new_messages
@@ -739,6 +857,7 @@ def import_wechat_modules() -> dict[str, Any]:
         "NotLoginError": NotLoginError,
         "NotStartError": NotStartError,
         "SystemSettings": SystemSettings,
+        "Texts": Texts(),
         "Tools": Tools,
         "pyautogui": pyautogui,
         "scan_for_new_messages": scan_for_new_messages,
